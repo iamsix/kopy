@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+from attr import dataclass
 from jsonrpc_websocket import Server
 from nicegui import app, ui
 from typing_extensions import Self
@@ -7,7 +8,27 @@ from typing import Optional, Type
 from types import TracebackType
 import functools
 
+#TODO : Bind some labels/etc to this data
+@dataclass
+class PlayStatus:
+    _time_seconds = 0
+    _duration_seconds = 0
+    muted = False
+    paused = False
+    now_playing = False
+    playing_title = ""
+    # Do a getter on time_str that returns formatted
+    # possibly a different getter for a duration delta but 
+    # can probably do that entirely internally
+    time_str = "00:00:00"
+    duration_str = "02:00:00 (12:00 PM)"
+    play_data = {}
+
+ITEM_PROPS = ["album","albumartist","artist","episode","art","file","genre","plot","rating","season","showtitle","studio","tagline","title","track","year","streamdetails","originaltitle","playcount","runtime","duration","cast","writer","director","userrating","firstaired","displayartist","uniqueid"]
+PLAYER_PROPS = ["audiostreams","canseek","currentaudiostream","currentsubtitle","partymode","playlistid","position","repeat","shuffled","speed","subtitleenabled","subtitles","time","totaltime","type","videostreams","currentvideostream"]
+FILE_PROPS = ["title","rating","genre","artist","track","season","episode","year","duration","album","showtitle","playcount","file","mimetype","size","lastmodified","resume","art","runtime","displayartist"]
 class Remote:
+    status = PlayStatus
     _closed = True
     buttons = {}
     #kodi = None
@@ -65,7 +86,7 @@ class Remote:
         app.on_disconnect(self.disconnect)
         #
         #await self.connect()
-        ui.run(native=True, dark=True, title="Kopy")
+        ui.run(dark=True, title="Kopy")
 
        
         #await asyncio.sleep(5)
@@ -73,6 +94,25 @@ class Remote:
         #ui.button("test", on_click=self.kodi.GUI.ShowNotification)#self.test)
         #ui.run()
 
+    async def notification(self, data, sender):
+        print(data)
+        print(sender)
+        if 'title' in data['item']:
+            self.nowplaying.set_text(data['item']['title'])
+            self.nowplaying.tooltip(data['item']['title'])
+        else:
+            self.nowplaying.set_text(data['item']['id'])
+
+
+    async def volchange(self, data, sender):
+        self.status.muted = data['muted']
+        if data['muted']:
+            self.mutebtn.props('color=red')
+        else:
+            self.mutebtn.props('color=default')
+
+    def notifyall(self, **kwargs):
+        print("Notifyall", kwargs)
 
     async def connect(self):
         print("Connect")
@@ -88,8 +128,22 @@ class Remote:
         #self.kodi.close()
 
     async def post_connect(self):
+        # Technically only need the timer active while playing
+        # can use the websocket callbacks to activate/deactivate
+        #ui.timer(1.0, self.update_kodi_state)
+        await self.update_kodi_state()
+
+        self.kodi.Player.OnPlay = self.notification
+        self.kodi.Player.OnStop = self.notification
+        self.kodi.Player.OnPause = self.notification
+        self.kodi.Player.OnResume = self.notification
+        self.kodi.Player.OnSeek = self.notification
+        self.kodi.Player.OnPropertyChanged = self.notifyall
+        self.kodi.Application.OnVolumeChanged = self.volchange
+        self.kodi.JSONRPC.NotifyAll = self.notifyall
         self.buttons = {
             "volume_down": [self.kodi.Input.ExecuteAction, 'volumedown'],
+            "volume_off": [self.kodi.Application.SetMute, {'mute': 'toggle'}],
             "volume_up": [self.kodi.Input.ExecuteAction, 'volumeup'],
             "fullscreen": [self.kodi.Input.ButtonEvent, {"button" : "display", "keymap": 'R1'} ],
          #   "fullscreen": [self.kodi.Input.ExecuteAction, 'togglefullscreen'],
@@ -98,42 +152,49 @@ class Remote:
             'format_list_bulleted': [self.kodi.Input.ButtonEvent, {"button" : "title", "keymap": 'R1'}],
             'info': [self.kodi.Input.ButtonEvent, {"button" : "info", "keymap": 'R1'}],
 
-            'expand_less': [self.kodi.Input.Up, None], #UP
+            'expand_less': [self.kodi.Input.ButtonEvent, {"button" : "up", "keymap": 'R1'}], #UP
             'chevron_left': [self.kodi.Input.ButtonEvent, {"button" : "left", "keymap": 'R1'}], # [self.kodi.Input.Left, None], #LEFT
-            'circle': [self.kodi.Input.Select, None], # OK / Select
-            'chevron_right': [self.kodi.Input.Right, None], #Right
-            'arrow_back': [self.kodi.Input.Back, None], # Back
-            'expand_more': [self.kodi.Input.Down, None], # DOWN
+            'circle': [self.kodi.Input.ButtonEvent, {"button" : "select", "keymap": 'R1'}], # OK / Select
+            'chevron_right': [self.kodi.Input.ButtonEvent, {"button" : "right", "keymap": 'R1'}], #Right
+            'arrow_back': [self.kodi.Input.ButtonEvent, {"button" : "back", "keymap": 'R1'}], # Back
+            'expand_more': [self.kodi.Input.ButtonEvent, {"button" : "down", "keymap": 'R1'}], # DOWN
         
-        }   
-
-    async def toggle_mute(self, button):
-        res = await self.kodi.Application.SetMute(mute="toggle")
-        if res:
-            button.sender.props('color=default')
-        
-        else:
-            button.sender.props('color=red')
+        } 
 
 
     async def btn_dis(self, button):
         #print(button.sender)
-        btn, arg = self.buttons[button.sender._props['icon']]
+        cmd, arg = self.buttons[button.sender._props['icon']]
+        print("id", button.sender.id)
         #print(arg)
 
         if type(arg) is dict:
-            await btn(**arg)
+            await cmd(**arg)
         elif not arg:
-            await btn()
+            await cmd()
         else:
-            await btn(arg)
+            await cmd(arg)
        # 
         #await self.kodi.Input.ExecuteAction('volumedown')
+
+    async def update_kodi_state(self):
+         #   itemdata = await self.kodi.Player.GetItem(playerid=1, properties=ITEM_PROPS)
+     #   print(itemdata)
+        players = await self.kodi.Player.GetActivePlayers()
+        print(players)
+        if players:
+            playerdata = await self.kodi.Player.GetProperties(playerid=1, properties=PLAYER_PROPS)
+            print(playerdata)
+            tsd = playerdata['time']
+            ts = f"{tsd['hours']:02}:{tsd['minutes']:02}:{tsd['seconds']:02}"
+            self.timestamp.set_text(ts)
 
     def build_ui(self):
         ui.add_head_html("<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no'>")
         ui.add_head_html("<meta name='apple-mobile-web-app-capable' content='yes'>")
         ui.add_head_html("<meta name='apple-mobile-web-app-tatus-bar-style' content='black'>")
+
+        
 
         with ui.header(elevated=True).style('background-color: #3874c8').classes('items-center justify-between'):
             ui.button(on_click=lambda: left_drawer.toggle(), icon='menu').props('flat color=white')
@@ -164,6 +225,8 @@ class Remote:
                     with ui.element('q-item-section'): 
                         ui.label('Remote') 
 
+        
+
         with ui.right_drawer(value=False).props("overlay") as right_drawer:
             
             with ui.row().style("gap: 0").classes("items-center justify-between"):
@@ -176,44 +239,63 @@ class Remote:
             with ui.row().classes('items-center justify-between q-my-xl'):
                 #voldn = functools.partial(self.kodi.Input.ExecuteAction, "volumedown")
                 ui.button(icon="volume_down", on_click=self.btn_dis).classes("text-2xl")
-                ui.button(icon="volume_off", on_click=self.toggle_mute).classes("text-2xl")
+                self.mutebtn = ui.button(icon="volume_off", on_click=self.btn_dis).classes("text-2xl")
                 ui.button(icon="volume_up", on_click=self.btn_dis).classes("text-2xl")
                 ui.button(icon='fullscreen', on_click=self.btn_dis).classes("text-xl")
                 ui.button(icon='info', on_click=self.btn_dis).classes("text-xl")
-                ui.button(icon='keyboard', on_click=self.btn_dis).classes("text-xl")
+                # TODO: This button. It does some 'send text' thing....
+                ui.button(icon='keyboard', on_click=self.btn_dis).classes("text-xl").disable() #???
+                # ------
                 ui.button(icon='call_to_action', on_click=self.btn_dis).classes("text-xl")
                 ui.button(icon='format_list_bulleted', on_click=self.btn_dis).classes("text-xl")
+     
+            # TEST ==============
+            self.rptcounter = 0
+            self.repeatbutton = False
+            async def repeattest(button):
+                print(button)
+                self.repeatbutton = True
+                #while self.repeatbutton:
+                #    await asyncio.sleep(0.2)
+                #    await self.btn_dis(button)
+
+            async def stoprepeat(button):
+                self.repeatbutton = False
 
 
+            # -----------------
             with ui.grid(columns=3).classes('absolute-bottom-right q-mb-xl q-mr-sm'):
                 ui.label("")
                 ui.button(icon="expand_less", on_click=self.btn_dis).classes("text-3xl").props("v-touch-repeat")
                 ui.label("")
            
-                ui.button(icon="chevron_left", on_click=self.btn_dis).classes("text-3xl").props("push v-touch-repeat:0:100.mouse")
-                ui.button(icon="circle", on_click=self.btn_dis).classes("text-3xl").props('v-touch-repeat')
-                ui.button(icon="chevron_right", on_click=self.btn_dis).classes("text-3xl").props('push v-touch-repeat:0:100.mouse.enter.space="click"')
+                ui.button(icon="chevron_left", on_click=self.btn_dis).classes("text-3xl").props("push v-touch-repeat.mouse")
+                test = ui.button(icon="circle", on_click=self.btn_dis).classes("text-3xl").props('v-touch-repeat')
+                #self.buttons[test.id] = [self.kodi.Input.ButtonEvent, {"button" : "select", "keymap": 'R1'}]
+                ## ========== TEST ==========
+                ui.button(icon="chevron_right").on('mousedown', repeattest).on('mouseup', stoprepeat).classes("text-3xl").props('push v-touch-repeat.mouse')
 
                 ui.button(icon="arrow_back", on_click=self.btn_dis).classes("text-xl").props('v-touch-repeat')
                 ui.button(icon="expand_more", on_click=self.btn_dis).classes("text-3xl").props('v-touch-repeat')
-                
+
+
 
         with ui.footer().style("gap: 0; padding: 0; background-color: #222").classes('items-center') as footer:
-            
+            #TODO: Change a lot of this data to bind to the class data
             with ui.column().classes('w-3/5').style("gap: 0; padding: 0"):
-                slider = ui.slider(min=0, max=100, value=50).props('label')# label-value="00:32:10"')
+                self.progress = slider = ui.slider(min=0, max=100, value=50).props('label')# label-value="00:32:10"')
                 with ui.row().classes("w-full justify-between"):
-                    ui.label("00:00:35") ##.bind_text_from(slider, 'value')
+                    self.timestamp = ui.label("00:00:35") ##.bind_text_from(slider, 'value')
                     
-                    ui.label("02:45:33 (3:44 PM)")
-                ui.label("And.You.Thought.Your.Parents.Were.Weird.1991.INTERNAL.720p.WEBRip-LAMA.mp4").classes('w-full text-bold text-lg truncate').tooltip("asdaf")
+                    self.vidlength = ui.label("02:45:33 (3:44 PM)")
+                self.nowplaying = ui.label("And.You.Thought.Your.Parents.Were.Weird.1991.INTERNAL.720p.WEBRip-LAMA.mp4").classes('w-full text-bold text-lg truncate').tooltip("asdaf")
         # ui.element('q-separator').props('vertical').style("margin-left: 10px")
 
             #TODO: make the small buttons vertical bigger/squarish
             with ui.row().style("gap: 0;").classes('items-center absolute-right'):
                 ui.button(icon="skip_previous").classes("text-xs").props('flat color=white')
                 ui.button(icon="fast_rewind").classes("text-xs").props('flat color=white')
-                ui.button(icon="play_circle_filled").classes("text-lg").props('flat color=white')
+                self.playpausebtn = ui.button(icon="play_circle_filled").classes("text-lg").props('flat color=white')
                 ui.button(icon="fast_forward").classes("text-xs").props('flat color=white')
                 ui.button(icon="skip_next").classes("text-xs").props('flat color=white')
                 ui.button(icon="stop").classes("text-xs").props('flat color=white')
@@ -253,7 +335,7 @@ class Remote:
         #TODO some kind of .. or up-path thing
         self.header.set_text(path)
         self.content.clear()
-        files = await self.kodi.Files.GetDirectory(path, "video",["title","rating","genre","artist","track","season","episode","year","duration","album","showtitle","playcount","file","mimetype","size","lastmodified","resume","art","runtime","displayartist"] ,{"method":"date","order":"descending"} )
+        files = await self.kodi.Files.GetDirectory(path, "video",FILE_PROPS ,{"method":"date","order":"descending"} )
         
         with self.content:
             for file in files['files']:
