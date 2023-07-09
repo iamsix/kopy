@@ -7,6 +7,7 @@ from typing_extensions import Self
 from typing import Optional, Type
 from types import TracebackType
 import functools
+from urllib import parse
 
 from datetime import datetime, timedelta
 
@@ -26,8 +27,9 @@ class PlayStatus:
     # TODO: Do a getter on time_str that returns formatted
     # possibly a different getter for a duration delta but 
     # can probably do that entirely internally
+    # it looks like even an @properrty doesn't work properly with binding
     time_str = "00:00:00"
-    duration_str = "02:00:00 (12:00 PM)"
+    duration_str = "02:00:00 (--:00 PM)"
 
     playing_data = {}
 
@@ -126,7 +128,18 @@ class Remote:
         self.kodi = Server(
             'ws://192.168.1.22:9090/jsonrpc',
             auth=aiohttp.BasicAuth('', ''))
-        await self.kodi.ws_connect()
+        tries = 0
+        while tries < 4:
+            print(f"Try {tries}")
+            try:
+                await self.kodi.ws_connect()
+            except Exception as e:
+                print(e)
+            tries += 1
+            if self.kodi.connected:
+                break
+            await asyncio.sleep(5)
+        
         self._closed = False
         await self.post_connect()
 
@@ -140,7 +153,7 @@ class Remote:
         
         await self.update_kodi_state(update_item=True)
 
-        ui.timer(1.0, self.update_kodi_state)
+        self.uitimer = ui.timer(1.0, self.update_kodi_state)
 
         self.kodi.Player.OnPlay = self.notification
         self.kodi.Player.OnStop = self.notification
@@ -184,11 +197,16 @@ class Remote:
         #print(arg)
 
         if type(arg) is dict:
-            await cmd(**arg)
+            ret = await cmd(**arg)
         elif not arg:
-            await cmd()
+            ret = await cmd()
         else:
-            await cmd(arg)
+            ret = await cmd(arg)
+
+        # A few of these do have stuff in return
+        # not sure what to actually do with it though
+        if not ret == "OK":
+            print(ret)
        # 
         #await self.kodi.Input.ExecuteAction('volumedown')
 
@@ -207,31 +225,40 @@ class Remote:
             return int(10000 * ratio)
         else:
             return 0
+        
+        # TODO - do this on mousemove?/ mouseover/events and such instead of every second
+        #self.progress.props(f'label label-value="{play_ts}"')
+
 
     async def update_kodi_state(self, update_item=False):
         if not self.kodi.connected:
-            print("Client is closed")
+            print("Client disconnected, attempting reconnect")
+            self.uitimer.deactivate()
+            await self.connect()
             return
         
         players = await self.kodi.Player.GetActivePlayers()
         #print(players)
         if players:
+            self.footer.set_value(True)
             # If there's a player we must be playing
             self.status.now_playing = True
             self.status.active_player_id = playerid=players[0]['playerid']
 
             if update_item:
                 itemdata = await self.kodi.Player.GetItem(playerid=self.status.active_player_id, properties=ITEM_PROPS)
-                #print(itemdata)
+                print(itemdata)
                 if itemdata:
                     self.status.playing_title = itemdata['item']['label']
             playerdata = await self.kodi.Player.GetProperties(playerid=self.status.active_player_id, properties=PLAYER_PROPS)
             #print(playerdata)
+            self.status.playing_data = playerdata
             speed = playerdata['speed']
             if not speed:
                 self.status.paused = True
             else:
                 self.status.paused = False
+
 
             await self.toggle_playpause_button()
             npt = timedelta(**playerdata['time'])
@@ -244,10 +271,10 @@ class Remote:
             # Should be no need to redo this every second... 
             endtime = (datetime.now() + (dur - npt)).strftime("%I:%M %p")
             self.status.duration_str =  f"{self.seconds_to_time(dur.total_seconds())} ({endtime})"
-
-            # TODO - do this on mouseover/events and such instead of every second
-            #self.progress.props(f'label label-value="{play_ts}"')
-
+        else:
+            self.footer.set_value(False)
+        
+        
     async def toggle_playpause_button(self):
         #self.playpausebtn.set_visibility(False)
         if self.status.now_playing and self.status.paused:
@@ -351,9 +378,11 @@ class Remote:
                 ui.button(icon="arrow_back", on_click=self.btn_dis).classes("text-xl").props('v-touch-repeat')
                 ui.button(icon="expand_more", on_click=self.btn_dis).classes("text-3xl").props('v-touch-repeat')
 
+        
+        with ui.dialog() as self.dialog, ui.card():
+            ui.label("Test")
 
-
-        with ui.footer().style("gap: 0; padding: 0; background-color: #222").classes('items-center') as footer:
+        with ui.footer().style("gap: 0; padding: 0; background-color: #222").classes('items-center') as self.footer:
             #TODO: Change a lot of this data to bind to the class data
             with ui.column().classes('w-3/5').style("gap: 0; padding: 0"):
                 self.progress = slider = ui.slider(min=0, max=10000, value=50).bind_value_from(self.status, 'time_seconds', self.progress_format) #. label-value="00:32:10"')
@@ -361,8 +390,8 @@ class Remote:
                     self.timestamp = ui.label().bind_text_from(self.status, 'time_str') ##.bind_text_from(slider, 'value')
                     
                     self.vidlength = ui.label("00:00:00 (--:-- PM)").bind_text(self.status, 'duration_str')
-                self.nowplaying = ui.label().classes('w-full text-bold text-lg truncate').bind_text(self.status, 'playing_title').tooltip(self.status.playing_title)
-        # ui.element('q-separator').props('vertical').style("margin-left: 10px")
+                self.nowplaying = ui.label("&nbsp;").classes('w-full text-bold text-lg truncate').bind_text(self.status, 'playing_title').tooltip(self.status.playing_title)
+            # ui.element('q-separator').props('vertical').style("margin-left: 10px")
 
             #TODO: make the small buttons vertical bigger/squarish
             with ui.row().style("gap: 0;").classes('items-center absolute-right'):
@@ -376,7 +405,7 @@ class Remote:
                 # clicking one of those pops a dialog with the various panels of each
                 with ui.button(icon="more_vert").classes("text-xs").props('flat color=white').style("padding-top: 2em;padding-bottom: 2em"):
                     with ui.menu().props(remove='no-parent-event') as menu:
-                        ui.menu_item('Subtitles', on_click=self.downlaod_subs)
+                        ui.menu_item('Subtitles', on_click=self.subsdialog)
                         ui.menu_item('Video')
                         ui.menu_item('Audio')
                 
@@ -393,6 +422,19 @@ class Remote:
         #ui.button('test', on_click=test)
         self.content = ui.column().style("width: 100%").classes('pa-none')
 
+    async def subsdialog(self):
+        print("dialog")
+        self.dialog.clear()
+        with self.dialog, ui.card():
+            subs = {}
+            for sub in self.status.playing_data['subtitles']:
+                subs[sub['index']] = sub['name']
+            ui.button("Download", on_click=self.downlaod_subs)
+            ui.select(subs, value=0)
+        self.dialog.open()
+        print("open?")
+
+
     async def list_sources(self):
         sources = await self.kodi.Files.GetSources("video")
         videodb = {"file": "videoDB://", 'label': "- Database"}
@@ -407,12 +449,23 @@ class Remote:
 
     async def list_files(self, path):
         #print("FILE PATH", path)
-        #TODO some kind of .. or up-path thing
         self.header.set_text(path)
         self.content.clear()
         files = await self.kodi.Files.GetDirectory(path, "video",FILE_PROPS ,{"method":"date","order":"descending"} )
         
         with self.content:
+            #TODO This is a terrible way to do this. Pathlib doesn't like the smb:// in the URI
+            # url libraries can probably work with it, but they're not usually considered structured path
+            # Instead I should have a full list of breadcrumb history
+            parent = path[:path.rfind("/")]
+            parent = parent[:parent.rfind("/")] + "/"
+            print(parent)
+
+            callback = functools.partial(self.list_files, parent)
+            with ui.row().on("mousedown", callback).style("width:100%;").classes('ma-none'):
+                ui.icon("folder").classes('text-2xl')
+                ui.label("..")
+        
             #might change these to q-list but I'm not sure how to clear it afterwards
             # as far as I can tell the element thing can clear()
             for file in files['files']:
@@ -430,7 +483,10 @@ class Remote:
                     params = {"item": {"file" : file['file']}}
                     callback = functools.partial(self.kodi.Player.Open, **params)
                     with ui.row().on("mousedown", callback).style("width:100%;"):
-                        ui.icon("description").classes('text-2xl')
+                        if 'playcount' in file:
+                            ui.icon("task").classes('text-2xl')
+                        else:
+                            ui.icon("description").classes('text-2xl')
 
                         ui.label(file['label']) #.tooltip(f"Watched: {file['playcount']}")
 
